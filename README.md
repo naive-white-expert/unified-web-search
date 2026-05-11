@@ -17,6 +17,8 @@
 pip install unified-web-search
 ```
 
+或作为 Claw Skill 使用：将本目录放入技能目录即可。
+
 ## 快速开始
 
 ```python
@@ -35,6 +37,7 @@ result = search("政策分析", intensity="deep", sites=["gov.cn"])
 if result["success"]:
     print(result["answer"])      # 答案文本
     print(result["sources"])     # 来源列表
+    print(result["provider"])    # 使用的服务商
 else:
     print(result["error"])       # 错误信息
 ```
@@ -46,7 +49,7 @@ else:
 | query | str | 必填 | 搜索问题 |
 | intensity | str | `"normal"` | 搜索强度：`quick`（快速）/`normal`（平衡）/`deep`（全面） |
 | freshness | int | None | 时效筛选：7/30/180/365 天 |
-| sites | list | None | 限定站点：["gov.cn"] |
+| sites | list | None | 限定站点：["gov.cn"]（百炼/Tavily 支持，火山引擎暂不支持） |
 
 ## 返回值
 
@@ -55,19 +58,24 @@ else:
     "success": True,
     "answer": "答案文本",
     "sources": [{"title": "...", "url": "...", "snippet": "..."}],
-    "provider": ["bailian", "ark"],  # 使用的服务商
+    "provider": ["bailian", "volcengine"],   # 使用的服务商
     "alerts": [{"provider": "tavily", "error": "..."}]  # 失败告警
 }
 ```
 
 ## 配置密钥
 
-### 方式 1：环境变量
+### 方式 1：环境变量（推荐）
 
 ```bash
+# 百炼（推荐国内搜索）
 export BAILIAN_API_KEY="sk-eb..."
+
+# Tavily（推荐海外搜索）
 export TAVILY_API_KEY="tvly-dev-..."
-export ARK_API_KEY="..."
+
+# 火山引擎联网搜索（国内搜索，每月 500 次免费额度）
+export WEB_SEARCH_API_KEY="aZOmTh5u..."
 ```
 
 ### 方式 2：配置文件
@@ -79,23 +87,45 @@ bailian:
   api_key: sk-eb...
 tavily:
   api_key: tvly-dev-...
-ark:
-  api_key: ...
+volcengine_search:
+  api_key: aZOmTh5u...
 ```
 
 ## 服务商说明
 
-| 服务商 | 适用场景 | 特点 |
-|--------|----------|------|
-| 百炼（Bailian） | 国内搜索 | 阿里云，中文优化，速度快 |
-| Tavily | 海外搜索 | 专为 AI 设计，结果质量高 |
-| 火山引擎（Ark） | 国内搜索 | 字节跳动，稳定可靠 |
+| 服务商 | 适用场景 | 特点 | 环境变量 |
+|--------|----------|------|----------|
+| 百炼（Bailian） | 国内搜索 | 阿里云，中文优化，速度快，answer 质量高 | `BAILIAN_API_KEY` |
+| Tavily | 海外搜索 | 专为 AI 设计，结果质量高，自带 answer 摘要 | `TAVILY_API_KEY` |
+| 火山引擎（Volcengine Search） | 国内搜索 | 字节跳动，每月 500 次免费额度，支持权威过滤和时间范围 | `WEB_SEARCH_API_KEY` |
+
+## 搜索强度与服务商路由
+
+| 强度 | 国内搜索 | 海外搜索 | 耗时 |
+|------|----------|----------|------|
+| quick | 火山引擎 | Tavily | ~2s |
+| normal | 百炼 + 火山引擎 | Tavily + 火山引擎 | ~4s |
+| deep | 百炼 + 火山引擎 + Tavily | 百炼 + 火山引擎 + Tavily | ~6s |
+
+## ⚠️ 火山引擎密钥说明
+
+火山引擎有**三种不同的 key**，用途完全不同，互不通用：
+
+| Key 类型 | 格式 | 用途 | 本 skill 支持 |
+|----------|------|------|--------------|
+| 联网搜索 API Key | 非标准（如 `aZOmTh5u...`） | 联网搜索专用 | ✅ 使用 `WEB_SEARCH_API_KEY` |
+| agentplan key | `ark-cdab573e-...` | 仅 Agent Plan 聊天 | ❌ |
+| 通用 ARK API Key | `ark-xxx`（标准格式） | 模型推理 + 搜索工具 | ❌ |
+
+联网搜索 API Key 获取方式：
+- 个人用户：[联网搜索控制台](https://console.volcengine.com/search-infinity/api-key) → 创建 API Key
+- Agent Plan 用户：[Agent Plan 控制台](https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement?LLM=%7B%7D&advancedActiveKey=agentPlan) → 配置 Harness → 联网搜索 → 查看 API Key
 
 ## 开发
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/unified-web-search.git
+git clone https://github.com/naive-white-expert/unified-web-search.git
 cd unified-web-search
 
 # 安装依赖

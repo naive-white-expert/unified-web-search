@@ -2,11 +2,10 @@ from setuptools import setup, find_packages
 
 setup(
     name="unified-web-search",
-    version="1.0.0",
-    description="联网搜索统一接口 - 一个接口，自动选择最优服务商",
+    version="2.0.0",
+    description="联网搜索统一接口 - 一个接口，自动选择最优服务商（百炼/Tavily/火山引擎）",
     author="Kang Rui",
-    author_email="your.email@example.com",
-    url="https://github.com/yourusername/unified-web-search",
+    url="https://github.com/naive-white-expert/unified-web-search",
     packages=find_packages(),
     install_requires=[
         "PyYAML>=5.0",

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="unified-web-search",
-    version="2.0.0",
+    version="2.1.0",
     description="联网搜索统一接口 - 一个接口，自动选择最优服务商（百炼/Tavily/火山引擎）",
     author="Kang Rui",
     url="https://github.com/naive-white-expert/unified-web-search",

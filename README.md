@@ -30,8 +30,15 @@ result = search("北京天气", intensity="quick")
 # 一般查询 + 时效筛选
 result = search("AI新闻", intensity="normal", freshness=7)
 
+# 精确日期窗口
+result = search("AI新闻", start_date="2026-06-21", end_date="2026-06-22")
+
 # 深度查询 + 站点限定
 result = search("政策分析", intensity="deep", sites=["gov.cn"])
+
+# 平台定向（小红书 / 微信）
+result = search("护肤测评", platforms=["xiaohongshu"])
+result = search("行业周报", platforms=["wechat"], freshness=7)
 
 # 使用结果
 if result["success"]:
@@ -47,9 +54,17 @@ else:
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | query | str | 必填 | 搜索问题 |
-| intensity | str | `"normal"` | 搜索强度：`quick`（快速）/`normal`（平衡）/`deep`（全面） |
-| freshness | int | None | 时效筛选：7/30/180/365 天 |
-| sites | list | None | 限定站点：["gov.cn"]（百炼/Tavily 支持，火山引擎暂不支持） |
+| intensity | str | `"normal"` | 搜索强度：`quick`/`normal`/`deep` |
+| freshness | int | None | 相对时效：7/30/180/365 天 |
+| start_date | str | None | 起始日期 `YYYY-MM-DD` |
+| end_date | str | None | 结束日期 `YYYY-MM-DD` |
+| sites | list | None | 域名白名单 |
+| exclude_sites | list | None | 域名黑名单 |
+| platforms | list | None | 平台别名：`xiaohongshu`/`wechat`/`weibo` 等 |
+| auth_level | int | 0 | 权威过滤（火山原生） |
+| topic | str | `"general"` | Tavily 话题：`general`/`news`/`finance` |
+
+参数按后端能力路由：支持则原生传入，否则用较宽 freshness + 后处理过滤。
 
 ## 返回值
 

@@ -80,16 +80,89 @@ def _get_bailian_key() -> str:
     return ""
 
 
+def _is_valid_key(key: str, min_len: int = 10) -> bool:
+    k = (key or "").strip()
+    return bool(k) and len(k) >= min_len and "..." not in k
+
+
+def _collect_env_keys(
+    *env_names: str,
+    numbered_prefix: str = "",
+    config_section: str = "",
+    config_key: str = "api_key",
+    min_len: int = 10,
+) -> List[str]:
+    """从环境变量收集密钥：主变量、逗号分隔、VAR_2/VAR_3…、config.yaml。"""
+    keys: List[str] = []
+    seen: set = set()
+
+    def add(raw: str) -> None:
+        for part in re.split(r"[,;\s]+", raw):
+            k = part.strip()
+            if _is_valid_key(k, min_len) and k not in seen:
+                seen.add(k)
+                keys.append(k)
+
+    for name in env_names:
+        val = os.getenv(name, "")
+        if val:
+            add(val)
+
+    prefix = numbered_prefix or (env_names[0] if env_names else "")
+    if prefix:
+        for i in range(2, 21):
+            val = os.getenv(f"{prefix}_{i}", "")
+            if val:
+                add(val)
+
+    if config_section:
+        config = _load_config()
+        section = config.get(config_section, {})
+        cfg_val = section.get(config_key, "")
+        if isinstance(cfg_val, str) and cfg_val:
+            add(cfg_val)
+        elif isinstance(cfg_val, list):
+            for item in cfg_val:
+                if isinstance(item, str):
+                    add(item)
+
+    return keys
+
+
+def _get_tavily_keys() -> List[str]:
+    """获取 Tavily API Key 池（TAVILY_API_KEY、TAVILY_API_KEY_2…）"""
+    return _collect_env_keys(
+        "TAVILY_API_KEY",
+        numbered_prefix="TAVILY_API_KEY",
+        config_section="tavily",
+        min_len=20,
+    )
+
+
 def _get_tavily_key() -> str:
-    """获取 Tavily API Key"""
-    key = os.getenv("TAVILY_API_KEY")
-    if key and len(key) > 20 and "..." not in key:
-        return key
-    config = _load_config()
-    cfg_key = config.get("tavily", {}).get("api_key", "")
-    if cfg_key and "..." not in cfg_key and len(cfg_key) > 20:
-        return cfg_key
-    return ""
+    keys = _get_tavily_keys()
+    return keys[0] if keys else ""
+
+
+def _get_zhipu_key() -> str:
+    keys = _collect_env_keys(
+        "ZHIPU_API_KEY",
+        numbered_prefix="ZHIPU_API_KEY",
+        config_section="zhipu",
+        min_len=20,
+    )
+    return keys[0] if keys else ""
+
+
+def _get_tencent_wsa_keys() -> List[str]:
+    """腾讯云 WSA（TENCENT_WSA_APIKEY / TENCENT_WSA_API_KEY 及 _2…）"""
+    return _collect_env_keys(
+        "TENCENT_WSA_APIKEY",
+        "TENCENT_WSA_API_KEY",
+        numbered_prefix="TENCENT_WSA_APIKEY",
+        config_section="tencent_wsa",
+        min_len=10,
+    )
 
 
 def _get_volcengine_search_key() -> str:
@@ -345,7 +418,11 @@ def _bailian_search(
         return {"success": False, "error": str(e), "provider": "bailian"}
 
 
-def _tavily_search(
+_TAVILY_ROTATABLE_HTTP = frozenset({401, 429, 432, 433})
+
+
+def _tavily_search_with_key(
+    api_key: str,
     query: str,
     freshness: int = None,
     sites: list = None,
@@ -354,11 +431,6 @@ def _tavily_search(
     end_date: Optional[date] = None,
     topic: str = "general",
 ) -> dict:
-    """Tavily 搜索 — 支持精确日期、include/exclude domains、topic"""
-    api_key = _get_tavily_key()
-    if not api_key:
-        return {"success": False, "error": "Tavily密钥未配置", "provider": "tavily"}
-
     endpoint = "https://api.tavily.com/search"
     payload = {
         "api_key": api_key,
@@ -396,9 +468,273 @@ def _tavily_search(
                 })
             return {"success": True, "answer": answer, "sources": sources, "provider": "tavily"}
     except urllib.error.HTTPError as e:
-        return {"success": False, "error": f"HTTP {e.code}", "provider": "tavily"}
+        return {"success": False, "error": f"HTTP {e.code}", "provider": "tavily", "http_code": e.code}
     except Exception as e:
         return {"success": False, "error": str(e), "provider": "tavily"}
+
+
+def _tavily_search(
+    query: str,
+    freshness: int = None,
+    sites: list = None,
+    exclude_sites: list = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    topic: str = "general",
+) -> dict:
+    """Tavily — 主力 Key 优先；432/433 时标记主力耗尽并切备用 Key。"""
+    keys = _get_tavily_keys()
+    if not keys:
+        return {"success": False, "error": "Tavily密钥未配置", "provider": "tavily"}
+
+    primary_key, backup_keys = keys[0], keys[1:]
+    result = _tavily_search_with_key(
+        primary_key, query, freshness, sites, exclude_sites, start_date, end_date, topic,
+    )
+    if result.get("success"):
+        return result
+
+    last_err = result.get("error", "")
+    http_code = result.get("http_code")
+    if http_code in _TAVILY_ROTATABLE_HTTP:
+        _mark_tavily_primary_exhausted()
+        for idx, backup_key in enumerate(backup_keys):
+            result = _tavily_search_with_key(
+                backup_key, query, freshness, sites, exclude_sites,
+                start_date, end_date, topic,
+            )
+            if result.get("success"):
+                result = dict(result)
+                result["key_rotated"] = idx + 2
+                result["using_backup_key"] = True
+                return result
+            last_err = result.get("error", "")
+            http_code = result.get("http_code")
+            if http_code not in _TAVILY_ROTATABLE_HTTP:
+                return result
+
+    return {"success": False, "error": last_err or "Tavily全部密钥不可用", "provider": "tavily"}
+
+
+_ZHIPU_RECENCY = {7: "oneWeek", 30: "oneMonth", 180: "oneYear", 365: "oneYear"}
+
+_TAVILY_STATE_NAME = "tavily-key-state.json"
+
+
+def _tavily_state_path() -> Path:
+    hermes = os.getenv("HERMES_HOME", "").strip()
+    if hermes:
+        base = Path(hermes).expanduser() / ".unified-web-search"
+    else:
+        base = CONFIG_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    return base / _TAVILY_STATE_NAME
+
+
+def _load_tavily_state() -> dict:
+    path = _tavily_state_path()
+    if path.is_file():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_tavily_state(state: dict) -> None:
+    path = _tavily_state_path()
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _mark_tavily_primary_exhausted() -> None:
+    """主力 Key（TAVILY_API_KEY）当月额度耗尽时标记，路由切智谱优先。"""
+    state = _load_tavily_state()
+    state["primary_exhausted_month"] = date.today().strftime("%Y-%m")
+    state["primary_exhausted_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_tavily_state(state)
+
+
+def _is_tavily_primary_available() -> bool:
+    """主力 Key 当月是否仍有免费额度（未触发 432）。"""
+    if not _get_tavily_keys():
+        return False
+    state = _load_tavily_state()
+    return state.get("primary_exhausted_month") != date.today().strftime("%Y-%m")
+
+
+def _zhipu_item_url(item: dict) -> str:
+    """智谱部分结果 link 为空，尝试 refer / 正文中的 URL。"""
+    for field in ("link", "url", "refer"):
+        val = (item.get(field) or "").strip()
+        if val.startswith("http://") or val.startswith("https://"):
+            return val
+    refer = item.get("refer") or ""
+    m = re.search(r"https?://[^\s\]>\"']+", refer)
+    return m.group(0) if m else ""
+
+
+def _source_dedup_key(source: dict) -> str:
+    url = (source.get("url") or "").strip()
+    if url:
+        return url
+    title = (source.get("title") or "").strip()
+    snippet = (source.get("snippet") or "")[:80]
+    if title or snippet:
+        return f"nourl:{title}:{snippet}"
+    return ""
+
+
+def _is_empty_search_result(merged: dict) -> bool:
+    """成功但无 answer 且无 sources → 视为空结果，应 fallback。"""
+    if not merged.get("success"):
+        return False
+    if (merged.get("answer") or "").strip():
+        return False
+    return not (merged.get("sources") or [])
+
+
+def _zhipu_search(
+    query: str,
+    count: int = 5,
+    freshness: int = None,
+    intensity: str = "normal",
+) -> dict:
+    """智谱 Web Search API — open.bigmodel.cn/api/paas/v4/web_search"""
+    api_key = _get_zhipu_key()
+    if not api_key:
+        return {"success": False, "error": "智谱密钥未配置", "provider": "zhipu"}
+
+    engine = "search_pro" if intensity == "deep" else "search_std"
+    payload: Dict[str, Any] = {
+        "search_query": query[:70],
+        "search_engine": engine,
+        "count": min(max(count, 1), 50),
+        "search_intent": False,
+    }
+    if freshness:
+        payload["search_recency_filter"] = _ZHIPU_RECENCY.get(freshness, "noLimit")
+
+    endpoint = "https://open.bigmodel.cn/api/paas/v4/web_search"
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+            if raw.get("error"):
+                err = raw["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                return {"success": False, "error": msg, "provider": "zhipu"}
+
+            sources = []
+            snippets = []
+            for item in raw.get("search_result") or []:
+                snippet = item.get("content", "")
+                if snippet:
+                    snippets.append(snippet)
+                sources.append({
+                    "title": item.get("title", ""),
+                    "url": _zhipu_item_url(item),
+                    "snippet": snippet[:300],
+                    "published_date": item.get("publish_date", ""),
+                    "site_name": item.get("media", ""),
+                })
+            if not sources and not snippets:
+                return {"success": False, "error": "智谱返回空结果", "provider": "zhipu"}
+            answer = "\n\n".join(snippets[:3]) if snippets else ""
+            return {"success": True, "answer": answer, "sources": sources, "provider": "zhipu"}
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8")[:200]
+        except Exception:
+            pass
+        return {"success": False, "error": f"HTTP {e.code}: {body}", "provider": "zhipu"}
+    except Exception as e:
+        return {"success": False, "error": str(e), "provider": "zhipu"}
+
+
+def _tencent_wsa_search_with_key(api_key: str, query: str) -> dict:
+    endpoint = "https://api.wsa.cloud.tencent.com/SearchPro"
+    payload = {"Query": query}
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+            resp = raw.get("Response") or {}
+            err = resp.get("Error")
+            if err:
+                code = err.get("Code", "")
+                msg = err.get("Message", "")
+                rotatable = code in ("UnauthorizedOperation", "AuthFailure", "RequestLimitExceeded")
+                return {
+                    "success": False,
+                    "error": f"[{code}] {msg}",
+                    "provider": "tencent",
+                    "rotatable": rotatable,
+                }
+
+            sources = []
+            snippets = []
+            for page in resp.get("Pages") or []:
+                if isinstance(page, str):
+                    try:
+                        page = json.loads(page)
+                    except json.JSONDecodeError:
+                        continue
+                if not isinstance(page, dict):
+                    continue
+                snippet = page.get("passage", "")
+                if snippet:
+                    snippets.append(snippet)
+                sources.append({
+                    "title": page.get("title", ""),
+                    "url": page.get("url", ""),
+                    "snippet": snippet[:300],
+                    "published_date": page.get("date", ""),
+                    "site_name": page.get("site", ""),
+                })
+            answer = "\n\n".join(snippets[:3]) if snippets else ""
+            return {"success": True, "answer": answer, "sources": sources, "provider": "tencent"}
+    except urllib.error.HTTPError as e:
+        return {
+            "success": False,
+            "error": f"HTTP {e.code}",
+            "provider": "tencent",
+            "rotatable": e.code in (401, 429),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "provider": "tencent"}
+
+
+def _tencent_wsa_search(query: str) -> dict:
+    """腾讯云 WSA SearchPro — 多 Key 轮换"""
+    keys = _get_tencent_wsa_keys()
+    if not keys:
+        return {"success": False, "error": "腾讯云WSA密钥未配置", "provider": "tencent"}
+
+    last_err = ""
+    for idx, api_key in enumerate(keys):
+        result = _tencent_wsa_search_with_key(api_key, query)
+        if result.get("success"):
+            if idx > 0:
+                result = dict(result)
+                result["key_rotated"] = idx + 1
+            return result
+        last_err = result.get("error", "")
+        if result.get("rotatable") and idx < len(keys) - 1:
+            continue
+        return result
+
+    return {"success": False, "error": last_err or "腾讯云WSA全部密钥不可用", "provider": "tencent"}
 
 
 def _volcengine_search(
@@ -544,10 +880,14 @@ def _available_providers() -> List[str]:
     out: List[str] = []
     if _get_bailian_key():
         out.append("bailian")
-    if _get_tavily_key():
+    if _get_tavily_keys():
         out.append("tavily")
     if _get_volcengine_search_key():
         out.append("volcengine")
+    if _get_zhipu_key():
+        out.append("zhipu")
+    if _get_tencent_wsa_keys():
+        out.append("tencent")
     return out
 
 
@@ -575,32 +915,38 @@ def _provider_count_for_intensity(intensity: str) -> int:
     return {"quick": 1, "normal": 1, "deep": 2}.get(intensity, 1)
 
 
+def _ensure_zhipu_not_sole_deep(
+    chosen: List[str], available: List[str], max_n: int,
+) -> List[str]:
+    """deep 模式禁止智谱单源（额度小，必须叠主源）。"""
+    if max_n < 2 or len(chosen) != 1 or chosen[0] != "zhipu":
+        return chosen
+    for partner in ("tavily", "volcengine", "tencent", "bailian"):
+        if partner in available:
+            return [partner, "zhipu"][:max_n]
+    return chosen
+
+
 def _select_providers(
     intensity: str,
     is_domestic: bool,
     domestic_only: bool,
     plan: Dict[str, Any],
     available: List[str],
+    *,
+    tavily_primary_available: bool = True,
 ) -> List[str]:
     """
-    按强度 / 地域 / 参数能力选后端，控制 API 次数：
-    quick/normal → 1 家；deep → 最多 2 家。
+    按强度 / 地域 / Tavily 主力额度选后端：
+    - 海外 + 主力 Tavily 有额度 → Tavily 第一源
+    - 海外 + 主力耗尽（走备用 Key）→ 智谱第一源，Tavily 备用
+    - deep → 智谱禁止单源
     """
     if not available:
         return []
 
-    topic = plan.get("topic", "general")
-    auth_level = plan.get("auth_level") or 0
     max_n = _provider_count_for_intensity(intensity)
-
-    # Tavily 独占：海外 + (news/finance topic)
-    tavily_exclusive = (
-        topic in ("news", "finance")
-        and not is_domestic
-        and "tavily" in available
-    )
-    if tavily_exclusive:
-        return ["tavily"][:max_n]
+    is_deep = intensity == "deep"
 
     chosen: List[str] = []
 
@@ -609,26 +955,79 @@ def _select_providers(
             chosen.append(name)
 
     if is_domestic or domestic_only:
-        # 国内：火山优先（sources+摘要+站点/日期/权威）；deep 再补百炼（answer 质量）
-        if auth_level > 0:
-            add("volcengine")
-        else:
-            add("volcengine")
-            if intensity == "deep":
-                add("bailian")
+        add("volcengine")
+        if is_deep:
+            for p in ("tencent", "bailian", "zhipu"):
+                add(p)
+                if len(chosen) >= max_n:
+                    break
         if not chosen:
-            add("bailian")
-        if not chosen:
+            for p in ("tencent", "bailian", "zhipu", "tavily"):
+                add(p)
+                if chosen:
+                    break
+    elif is_deep:
+        if tavily_primary_available:
             add("tavily")
+            add("zhipu")
+        else:
+            add("zhipu")
+            add("tavily")
+        if len(chosen) < max_n:
+            for p in ("tencent", "bailian"):
+                add(p)
+                if len(chosen) >= max_n:
+                    break
     else:
-        # 海外：Tavily 单点；deep 不再叠火山（边际低、浪费额度）
-        add("tavily")
-        if intensity == "deep":
-            add("bailian")
+        if tavily_primary_available:
+            add("tavily")
+        else:
+            add("zhipu")
+            if not chosen:
+                add("tavily")
         if not chosen:
-            add("volcengine")
+            for p in ("tencent", "bailian", "volcengine"):
+                add(p)
+                if chosen:
+                    break
 
-    return chosen[:max_n]
+    chosen = chosen[:max_n]
+    if is_deep:
+        chosen = _ensure_zhipu_not_sole_deep(chosen, available, max_n)
+    return chosen
+
+
+def _fallback_providers(
+    selected: List[str],
+    available: List[str],
+    is_domestic: bool,
+    domestic_only: bool,
+    intensity: str = "normal",
+    *,
+    tavily_primary_available: bool = True,
+    max_extra: int = 2,
+) -> List[str]:
+    """主路由全部失败时，按优先级尝试备用后端。"""
+    is_deep = intensity == "deep"
+    if is_domestic or domestic_only:
+        priority = ("volcengine", "tencent", "bailian", "tavily", "zhipu")
+    elif is_deep:
+        if tavily_primary_available:
+            priority = ("tavily", "zhipu", "tencent", "bailian", "volcengine")
+        else:
+            priority = ("zhipu", "tavily", "tencent", "bailian", "volcengine")
+    elif tavily_primary_available:
+        priority = ("tavily", "zhipu", "tencent", "bailian", "volcengine")
+    else:
+        priority = ("zhipu", "tavily", "tencent", "bailian", "volcengine")
+    tried = set(selected)
+    fallbacks: List[str] = []
+    for name in priority:
+        if name in available and name not in tried:
+            fallbacks.append(name)
+            if len(fallbacks) >= max_extra:
+                break
+    return fallbacks
 
 
 def _run_provider(
@@ -662,6 +1061,10 @@ def _run_provider(
             query, count=count, time_range=volc_tr,
             auth_level=auth_level, sites=merged_sites, exclude_sites=exclude_sites,
         )
+    if provider == "zhipu":
+        return _zhipu_search(query, count=count, freshness=eff_freshness, intensity=intensity)
+    if provider == "tencent":
+        return _tencent_wsa_search(query)
     return {"success": False, "error": f"unknown provider: {provider}", "provider": provider}
 
 
@@ -691,6 +1094,20 @@ def _provider_needs_post_filter(provider: str, plan: Dict[str, Any]) -> Tuple[bo
         if plan.get("start") and plan.get("end"):
             pf["start"] = plan["start"]
             pf["end"] = plan["end"]
+            needed = True
+    elif provider in ("zhipu", "tencent"):
+        if plan.get("sites"):
+            pf["sites"] = plan["sites"]
+            needed = True
+        if plan.get("exclude_sites"):
+            pf["exclude_sites"] = plan["exclude_sites"]
+            needed = True
+        if plan.get("start") and plan.get("end"):
+            pf["start"] = plan["start"]
+            pf["end"] = plan["end"]
+            needed = True
+        if plan.get("auth_level", 0) > 0:
+            pf["auth_level"] = plan["auth_level"]
             needed = True
 
     return needed, pf
@@ -750,30 +1167,30 @@ def search(
             eff_topic = "news"
 
     available = _available_providers()
+    tavily_primary = _is_tavily_primary_available()
     selected = _select_providers(
         intensity, is_domestic, domestic_only, plan, available,
+        tavily_primary_available=tavily_primary,
     )
     if not selected:
         return {
             "success": False,
-            "error": "无可用搜索密钥（需配置 BAILIAN/TAVILY/WEB_SEARCH_API_KEY 之一）",
+            "error": "无可用搜索密钥（需配置 BAILIAN/TAVILY/WEB_SEARCH/ZHIPU/TENCENT 之一）",
             "alerts": [],
         }
 
-    results = [
-        _run_provider(
-            p, query,
-            strategy=strategy,
-            plan=plan,
-            time_spec=time_spec,
-            merged_sites=merged_sites,
-            exclude_sites=exclude_sites,
-            auth_level=auth_level or 0,
-            eff_topic=eff_topic,
-            intensity=intensity,
-        )
-        for p in selected
-    ]
+    run_kw = dict(
+        strategy=strategy,
+        plan=plan,
+        time_spec=time_spec,
+        merged_sites=merged_sites,
+        exclude_sites=exclude_sites,
+        auth_level=auth_level or 0,
+        eff_topic=eff_topic,
+        intensity=intensity,
+    )
+
+    results = [_run_provider(p, query, **run_kw) for p in selected]
 
     # Per-provider post-filter where native API lacks support
     processed = []
@@ -788,7 +1205,41 @@ def search(
 
     merged = _merge_results(processed)
 
-    meta = {"routing": {"intensity": intensity, "providers": selected, "domestic": is_domestic}}
+    # 主路由全失败或空结果时自动 fallback（如智谱无 link、Tavily 432）
+    fallback_used: List[str] = []
+    if not merged.get("success") or _is_empty_search_result(merged):
+        if _is_empty_search_result(merged):
+            merged = {"success": False, "error": "主源返回空结果", "alerts": merged.get("alerts", [])}
+        fallbacks = _fallback_providers(
+            selected, available, is_domestic, domestic_only, intensity=intensity,
+            tavily_primary_available=tavily_primary,
+        )
+        if fallbacks:
+            fb_results = [_run_provider(p, query, **run_kw) for p in fallbacks]
+            fb_processed = []
+            for r in fb_results:
+                provider = r.get("provider", "")
+                needed, pf = _provider_needs_post_filter(provider, plan)
+                if needed and r.get("success"):
+                    sources = _post_filter_sources(list(r.get("sources") or []), **pf)
+                    r = dict(r)
+                    r["sources"] = sources
+                fb_processed.append(r)
+            merged = _merge_results(processed + fb_processed)
+            fallback_used = fallbacks
+
+    meta = {
+        "routing": {
+            "intensity": intensity,
+            "providers": selected,
+            "domestic": is_domestic,
+            "domestic_only": domestic_only,
+            "tavily_primary_available": tavily_primary,
+            "effective_topic": eff_topic,
+        }
+    }
+    if fallback_used:
+        meta["routing"]["fallback_providers"] = fallback_used
     if time_spec.get("has_exact_range"):
         meta["date_range"] = {
             "start": time_spec["start"].isoformat(),
@@ -838,12 +1289,12 @@ def _merge_results(results: list) -> dict:
     best_answer = max(answers, key=len) if answers else ""
 
     all_sources = []
-    seen_urls = set()
+    seen_keys = set()
     for r in successful:
         for s in r.get("sources", []):
-            url = s.get("url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
+            key = _source_dedup_key(s)
+            if key and key not in seen_keys:
+                seen_keys.add(key)
                 all_sources.append(s)
 
     return {
